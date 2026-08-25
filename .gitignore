@@ -1,0 +1,57 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+*.egg-info/
+
+# virtual environments
+.venv/
+
+# pytest
+.pytest_cache/
+
+# mypy
+.mypy_cache/
+
+# IDE
+.idea/
+.vscode/
+*.txt
+!requirements/*.txt
+*.log
+
+# Distribution
+dist/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# DS_Store
+.DS_Store
+*.models
+*.pt
+/wandb
+*.xyz
+/checkpoints
+*.model
+/results
+*.db
+
+.benchmarks
+*.png
+# Personal/scratch scripts stay untracked; the repo's own wrappers in
+# scripts/ remain tracked (gitignore does not affect already-tracked files).
+/scripts
+*.cube
+
+# coverage artifacts
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# local planning docs (not for the public repo)
+/doc
