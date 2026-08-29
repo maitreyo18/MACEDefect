@@ -24,7 +24,7 @@ from .blocks import (
     RealAgnosticResidualNonLinearInteractionBlock,
     ScaleShiftBlock,
 )
-from .extensions import PolarMACE
+from .extensions import MACEDefect, PolarMACE
 from .gate import GatedEquivariantBlock
 from .loss import (
     DipolePolarLoss,
@@ -112,6 +112,7 @@ __all__ = [
     "AtomicDielectricMACE",
     "EnergyDipolesMACE",
     "PolarMACE",
+    "MACEDefect",
     "WeightedEnergyForcesLoss",
     "WeightedForcesLoss",
     "WeightedEnergyForcesVirialsLoss",

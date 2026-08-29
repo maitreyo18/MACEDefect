@@ -92,7 +92,9 @@ class MACECalculator(Calculator):
         charges_key: str, Array field of atoms object where atomic charges are stored
         model_type: str, type of model to load
                     Options: [MACE, PolarMACE, DipoleMACE, DipolePolarizabilityMACE,
-                    EnergyDipoleMACE]
+                    EnergyDipoleMACE, MACE-Defect]
+        For MACE-Defect models, set atoms.info["total_charge"] (net charge Q);
+        results include interaction_energy, qeq_energy, qeq_charges.
         For PolarMACE models, per-atom Fukui functions are returned in
         results["fukui_functions"] with shape (num_atoms, 2)
 
@@ -167,7 +169,7 @@ class MACECalculator(Calculator):
         if info_keys is None:
             info_keys = {
                 "total_spin": "spin",
-                "total_charge": "charge",
+                "total_charge": "total_charge" if model_type == "MACE-Defect" else "charge",
                 "external_field": "external_field",
             }
         if arrays_keys is None:
@@ -184,12 +186,13 @@ class MACECalculator(Calculator):
             "EnergyDipoleMACE",
             "DipolePolarizabilityMACE",
             "PolarMACE",
+            "MACE-Defect",
         ]:
             raise ValueError(
-                f"Give a valid model_type: [MACE, PolarMACE, DipoleMACE, DipolePolarizabilityMACE, EnergyDipoleMACE], {model_type} not supported"
+                f"Give a valid model_type: [MACE, PolarMACE, DipoleMACE, DipolePolarizabilityMACE, EnergyDipoleMACE, MACE-Defect], {model_type} not supported"
             )
 
-        if model_type in ["MACE", "EnergyDipoleMACE", "PolarMACE"]:
+        if model_type in ["MACE", "EnergyDipoleMACE", "PolarMACE", "MACE-Defect"]:
             self.implemented_properties.extend(
                 [
                     "energy",
@@ -205,6 +208,10 @@ class MACECalculator(Calculator):
                 self.compute_atomic_stresses = True
         if model_type == "PolarMACE":
             self.implemented_properties.extend(["fukui_functions"])
+        if model_type == "MACE-Defect":
+            self.implemented_properties.extend(
+                ["interaction_energy", "qeq_energy", "qeq_charges"]
+            )
         if model_type in ["EnergyDipoleMACE", "DipoleMACE", "DipolePolarizabilityMACE"]:
             self.implemented_properties.extend(["dipole"])
         if model_type == "DipolePolarizabilityMACE":
@@ -243,7 +250,7 @@ class MACECalculator(Calculator):
         if self.num_models > 1:
             logging.info(f"Running committee mace with {self.num_models} models")
 
-            if model_type in ["MACE", "EnergyDipoleMACE", "PolarMACE"]:
+            if model_type in ["MACE", "EnergyDipoleMACE", "PolarMACE", "MACE-Defect"]:
                 self.implemented_properties.extend(
                     ["energy_comm", "energy_var", "forces_comm", "stress_var"]
                 )
@@ -488,6 +495,14 @@ class MACECalculator(Calculator):
                     "fukui_functions": [num_atoms, 2],
                 }
             )
+        if self.model_type == "MACE-Defect":
+            tensor_shapes.update(
+                {
+                    "interaction_energy": [],
+                    "qeq_energy": [],
+                    "qeq_charges": [num_atoms],
+                }
+            )
         dict_of_tensors = {}
         for key in out:
             if key not in tensor_shapes or out.get(key) is None:
@@ -612,7 +627,12 @@ class MACECalculator(Calculator):
         num_real_atoms = len(atoms)
         is_padded = self.pad_num_atoms > 0 or self.pad_num_edges > 0
 
-        compute_stress = self.model_type in ["MACE", "EnergyDipoleMACE", "PolarMACE"]
+        compute_stress = self.model_type in [
+            "MACE",
+            "EnergyDipoleMACE",
+            "PolarMACE",
+            "MACE-Defect",
+        ]
         # For oeq/hybrid + compile: create displacement outside the compiled
         # graph so autograd.grad (which runs as a graph break) can
         # differentiate energy w.r.t. displacement for stress.
@@ -699,6 +719,18 @@ class MACECalculator(Calculator):
                     ("density_coefficients", "density_coefficients", 1.0),
                     ("spin_charge_density", "spin_charge_density", 1.0),
                     ("fukui_functions", "fukui_functions", 1.0),
+                ]
+            )
+        if self.model_type == "MACE-Defect":
+            results_map.extend(
+                [
+                    (
+                        "interaction_energy",
+                        "interaction_energy",
+                        self.energy_units_to_eV,
+                    ),
+                    ("qeq_energy", "qeq_energy", self.energy_units_to_eV),
+                    ("qeq_charges", "qeq_charges", 1.0),
                 ]
             )
         for results_key, ret_key, unit_conv in results_map:

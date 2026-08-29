@@ -202,7 +202,7 @@ def configure_model(
         )
         model_config_foundation = None
 
-    model = _build_model(args, model_config, model_config_foundation, heads)
+    model = _build_model(args, model_config, model_config_foundation, heads, train_loader)
 
     if model_foundation is not None:
         if getattr(args, "finetune_dipoles_polarizabilities", False):
@@ -249,7 +249,7 @@ def _parse_literal_or_none(value):
 
 
 def _build_model(
-    args, model_config, model_config_foundation, heads
+    args, model_config, model_config_foundation, heads, train_loader=None
 ):  # pylint: disable=too-many-return-statements
     if args.model == "MACE":
         if args.interaction_first not in [
@@ -294,6 +294,38 @@ def _build_model(
             use_embedding_readout=args.use_embedding_readout,
             use_last_readout_only=args.use_last_readout_only,
             use_agnostic_product=args.use_agnostic_product,
+        )
+    if args.model == "MACEDefect":
+        known_charges = []
+        for d in train_loader.dataset:
+            q = getattr(d, "total_charge", None)
+            if q is not None:
+                try:
+                    known_charges.append(int(round(float(q.item() if hasattr(q, "item") else q))))
+                except (TypeError, ValueError):
+                    pass
+        known_charges = sorted(set(known_charges))
+        if not known_charges:
+            raise ValueError(
+                "No total_charge values found in training data "
+                "(key: 'total_charge'). Check your XYZ file has this info key."
+            )
+        logging.info(f"Charge states identified in training data: {known_charges}")
+        return modules.MACEDefect(
+            **model_config,
+            pair_repulsion=args.pair_repulsion,
+            distance_transform=args.distance_transform,
+            correlation=args.correlation,
+            gate=modules.gate_dict[args.gate],
+            interaction_cls_first=modules.interaction_classes[args.interaction_first],
+            MLP_irreps=o3.Irreps(args.MLP_irreps),
+            atomic_inter_scale=args.std,
+            atomic_inter_shift=args.mean,
+            radial_MLP=ast.literal_eval(args.radial_MLP),
+            radial_type=args.radial_type,
+            heads=heads,
+            known_charges=known_charges,
+            density_smearing_width=args.density_smearing_width,
         )
     if args.model == "PolarMACE" and model_config_foundation is not None:
         return modules.PolarMACE(**model_config_foundation)

@@ -233,9 +233,10 @@ def extract_config_mace_model(model: torch.nn.Module) -> Dict[str, Any]:
         "MACELES",
         "PolarMACE",
         "AtomicDielectricMACE",
+        "MACEDefect",
     ]:
         return {
-            "error": "Model is not a ScaleShiftMACE, MACELES, PolarMACE, or AtomicDielectricMACE model"
+            "error": "Model is not a ScaleShiftMACE, MACELES, PolarMACE, AtomicDielectricMACE, or MACEDefect model"
         }
 
     def radial_to_name(radial_type):
@@ -375,6 +376,9 @@ def extract_config_mace_model(model: torch.nn.Module) -> Dict[str, Any]:
         ).copy()
         config["field_readout_config"] = getattr(model, "_field_readout_config").copy()
         config["keep_last_layer_irreps"] = model.keep_last_layer_irreps
+    if model.__class__.__name__ == "MACEDefect":
+        config["known_charges"] = model.known_charges.tolist()
+        config["density_smearing_width"] = model.density_smearing_width
     return config
 
 
@@ -921,6 +925,18 @@ def get_params_options(
                 "name": "les_readouts",
                 "params": model.les_readouts.parameters(),
                 "weight_decay": 0.0,
+            }
+        )
+    if hasattr(model, "charge_embedding"):
+        charge_params = list(model.charge_embedding.parameters())
+        charge_params += list(model.chi_readouts.parameters())
+        charge_params += list(model.eta_readouts.parameters())
+        param_options["params"].append(
+            {
+                "name": "charge",
+                "params": charge_params,
+                "weight_decay": 0.0,
+                "lr": lr_params_factors.get("charge_lr_factor", 1.0) * args.lr,
             }
         )
     return param_options

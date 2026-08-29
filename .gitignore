@@ -55,3 +55,6 @@ htmlcov/
 
 # local planning docs (not for the public repo)
 /doc
+__pycache__/
+*.pyc
+*.pyo

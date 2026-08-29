@@ -92,6 +92,26 @@ def run(args) -> None:
     tag = tools.get_tag(name=args.name, seed=args.seed)
     args, input_log_messages = tools.check_args(args)
 
+    if args.model == "MACEDefect":
+        # Hyperparameters tuned for MACEDefect training; only applied where the
+        # user left the flag at mace's own default (i.e. didn't override it).
+        _macedefect_defaults = {
+            "batch_size": (16, 8),
+            "clip_grad": (10.0, 20.0),
+            "forces_weight": (100.0, 10.0),
+            "huber_delta": (0.01, 0.1),
+            "lr": (0.01, 1e-3),
+            "max_num_epochs": (2048, 200),
+            "num_channels": (None, 128),
+            "num_radial_basis": (8, 10),
+            "stress_weight": (1.0, 0.0),
+            "pin_memory": (True, False),
+            "valid_batch_size": (10, 8),
+        }
+        for flag, (mace_default, macedefect_default) in _macedefect_defaults.items():
+            if getattr(args, flag, mace_default) == mace_default:
+                setattr(args, flag, macedefect_default)
+
     # default keyspec to update using heads dictionary
     args.key_specification = KeySpecification()
     update_keyspec_from_kwargs(args.key_specification, vars(args))
@@ -490,8 +510,30 @@ def run(args) -> None:
         if head_config.atomic_energies_dict is None or len(head_config.atomic_energies_dict) == 0:
             assert head_config.E0s is not None, "Atomic energies must be provided"
             if all(check_path_ase_read(f) for f in head_config.train_file) and head_config.E0s.lower() not in ["foundation", "estimated"]:
+                e0s_train = head_config.collections.train
+                if args.model == "MACEDefect":
+                    # E0s (per-element reference energies) are only meaningful
+                    # from neutral structures; charged cells carry extra
+                    # electrostatic contributions not proportional to composition.
+                    neutral_train = [
+                        cfg
+                        for cfg in e0s_train
+                        if int(round(float(cfg.properties.get("total_charge", 0) or 0))) == 0
+                    ]
+                    if not neutral_train:
+                        raise ValueError(
+                            "No Q=0 (neutral) structures found in training data. "
+                            "E0s can only be computed from neutral structures for MACEDefect. "
+                            "Either add Q=0 structures or provide E0s explicitly via "
+                            "--E0s '{Z: E, ...}'."
+                        )
+                    logging.info(
+                        f"[E0s] Using {len(neutral_train)} neutral (Q=0) structures "
+                        f"out of {len(e0s_train)} total for E0s computation."
+                    )
+                    e0s_train = neutral_train
                 atomic_energies_dict[head_config.head_name] = get_atomic_energies(
-                    head_config.E0s, head_config.collections.train, head_config.z_table
+                    head_config.E0s, e0s_train, head_config.z_table
                 )
             elif head_config.E0s.lower() == "foundation":
                 assert args.foundation_model is not None
@@ -827,6 +869,24 @@ def run(args) -> None:
     logging.info(f"Learning rate: {args.lr}, weight decay: {args.weight_decay}")
     logging.info(loss_fn)
 
+    # MACEDefect: auto-enable cuequivariance on CUDA if available and the
+    # user didn't explicitly set --enable_cueq/--enable_oeq.
+    if (
+        args.model == "MACEDefect"
+        and not args.enable_cueq
+        and not args.enable_oeq
+        and device.type == "cuda"
+    ):
+        from mace.cli.convert_e3nn_cueq import CUEQQ_AVAILABLE
+
+        if CUEQQ_AVAILABLE:
+            logging.info("Auto-enabling CuEquivariance for MACEDefect on CUDA")
+            args.enable_cueq = True
+        else:
+            logging.info(
+                "CuEquivariance not installed; using vanilla e3nn for MACEDefect"
+            )
+
     # Cueq and OEQ conversion
     if args.enable_cueq and args.enable_oeq:
         logging.warning(
@@ -842,6 +902,7 @@ def run(args) -> None:
             "MACELES",
             "PolarMACE",
             "AtomicDielectricMACE",
+            "MACEDefect",
         ]
         model = run_e3nn_to_cueq(deepcopy(model), device=device)
     if args.enable_oeq:
@@ -1009,6 +1070,7 @@ def run(args) -> None:
         plotter=plotter,
         train_sampler=train_sampler,
         rank=rank,
+        verbose=args.verbose,
     )
 
     logging.info("")

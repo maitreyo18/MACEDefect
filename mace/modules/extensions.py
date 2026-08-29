@@ -12,6 +12,7 @@ try:
         gto_basis_kspace_cutoff,
     )
     from graph_longrange.kspace import compute_k_vectors_flat
+    from graph_longrange.utils import FIELD_CONSTANT
 
     GRAPH_LONGRANGE_AVAILABLE = True
 except (ImportError, ModuleNotFoundError):
@@ -987,4 +988,353 @@ class PolarMACE(ScaleShiftMACE):
             "electrostatic_potentials": esps,
             "spin_charge_density": spin_charge_density_mul_ir,
             "fukui_functions": final_fukui_sources,
+        }
+
+
+@compile_mode("script")
+class MACEDefect(ScaleShiftMACE):
+    """ScaleShiftMACE with total-charge conditioning and charge equilibration
+    (QEq) for charged systems. Requires data["total_charge"] per graph.
+    E_total = E0 + E_inter + E_QEq.
+    """
+
+    def __init__(
+        self,
+        known_charges: Optional[List[int]] = None,
+        density_smearing_width: float = 1.2,
+        **kwargs,
+    ):
+        if not GRAPH_LONGRANGE_AVAILABLE:
+            raise ImportError(
+                "MACEDefect requires graph_longrange "
+                "(pip install -r requirements/polar.txt)"
+            )
+        super().__init__(**kwargs)
+
+        kc_sorted = (
+            sorted(set(int(round(q)) for q in known_charges))
+            if known_charges is not None
+            else list(range(-3, 4))
+        )
+        self.register_buffer(
+            "known_charges", torch.tensor(kc_sorted, dtype=torch.long)
+        )
+        q_to_idx = {q: i for i, q in enumerate(kc_sorted)}
+        self.register_buffer(
+            "_q_to_idx_keys", torch.tensor(list(q_to_idx.keys()), dtype=torch.long)
+        )
+        self.register_buffer(
+            "_q_to_idx_vals", torch.tensor(list(q_to_idx.values()), dtype=torch.long)
+        )
+
+        ns = self.node_embedding.linear.irreps_out.dim
+        self.charge_embedding = torch.nn.Embedding(len(kc_sorted), ns)
+
+        hidden_irreps = o3.Irreps(kwargs["hidden_irreps"])
+        MLP_irreps = o3.Irreps(kwargs["MLP_irreps"])
+        gate = kwargs["gate"]
+        num_interactions = kwargs["num_interactions"]
+        heads = kwargs.get("heads") or ["Default"]
+        cueq_config = kwargs.get("cueq_config")
+        oeq_config = kwargs.get("oeq_config")
+
+        self.chi_readouts = torch.nn.ModuleList()
+        self.eta_readouts = torch.nn.ModuleList()
+        if num_interactions == 1:
+            for readouts in (self.chi_readouts, self.eta_readouts):
+                readouts.append(
+                    NonLinearReadoutBlock(
+                        str(hidden_irreps[0]),
+                        (len(heads) * MLP_irreps).simplify(),
+                        gate,
+                        o3.Irreps(f"{len(heads)}x0e"),
+                        len(heads),
+                        cueq_config,
+                        oeq_config,
+                    )
+                )
+        else:
+            hidden_irreps_out = hidden_irreps
+            for readouts in (self.chi_readouts, self.eta_readouts):
+                readouts.append(
+                    LinearReadoutBlock(
+                        hidden_irreps_out,
+                        o3.Irreps(f"{len(heads)}x0e"),
+                        cueq_config,
+                        oeq_config,
+                    )
+                )
+            for i in range(num_interactions - 1):
+                if i == num_interactions - 2:
+                    hidden_irreps_out = str(hidden_irreps[0])
+                else:
+                    hidden_irreps_out = hidden_irreps
+                if i == num_interactions - 2:
+                    for readouts in (self.chi_readouts, self.eta_readouts):
+                        readouts.append(
+                            NonLinearReadoutBlock(
+                                hidden_irreps_out,
+                                (len(heads) * MLP_irreps).simplify(),
+                                gate,
+                                o3.Irreps(f"{len(heads)}x0e"),
+                                len(heads),
+                                cueq_config,
+                                oeq_config,
+                            )
+                        )
+                else:
+                    for readouts in (self.chi_readouts, self.eta_readouts):
+                        readouts.append(
+                            LinearReadoutBlock(
+                                hidden_irreps,
+                                o3.Irreps(f"{len(heads)}x0e"),
+                                cueq_config,
+                                oeq_config,
+                            )
+                        )
+
+        self.density_smearing_width = density_smearing_width
+        kspace_cutoff = gto_basis_kspace_cutoff(
+            sigmas=[density_smearing_width], max_l=0
+        )
+        self.kspace_cutoff = kspace_cutoff
+        self.coulomb_energy = GTOElectrostaticEnergy(
+            density_max_l=0,
+            density_smearing_width=density_smearing_width,
+            kspace_cutoff=kspace_cutoff,
+            include_self_interaction=True,
+        )
+
+    def _solve_qeq_and_energy(self, chi, eta, positions, batch, cell, Q_tot, num_graphs):
+        device = positions.device
+        dtype = positions.dtype
+        n_atoms = positions.shape[0]
+
+        cell_3d = cell.view(num_graphs, 3, 3)
+        volume = torch.abs(torch.linalg.det(cell_3d))
+        r_cell = 2 * torch.pi * torch.linalg.inv(cell_3d).transpose(-1, -2)
+
+        k_vectors, k_norm2, k_vector_batch, k0_mask = compute_k_vectors_flat(
+            cutoff=self.kspace_cutoff, cell_vectors=cell_3d, r_cell_vectors=r_cell
+        )
+        density_basis_fs = self.coulomb_energy.density_basis(
+            k_vectors, k_norm2, k0_mask
+        )
+        B_r = density_basis_fs[:, 0, 0, 0]
+        B_i = density_basis_fs[:, 0, 0, 1]
+        B_sq = B_r * B_r + B_i * B_i
+
+        k0_bool = k0_mask > 0.0
+        w_k = torch.zeros_like(k_norm2)
+        w_k[~k0_bool] = B_sq[~k0_bool] / k_norm2[~k0_bool]
+
+        all_charges = torch.zeros(n_atoms, dtype=dtype, device=device)
+        e_qeq_list = []
+
+        for g in range(num_graphs):
+            idx_g = torch.where(batch == g)[0]
+            n_g = idx_g.shape[0]
+            pos_g = positions[idx_g]
+            chi_g = chi[idx_g]
+            eta_g = eta[idx_g]
+            vol_g = volume[g]
+
+            k_mask_g = k_vector_batch == g
+            k_vec_g = k_vectors[k_mask_g]
+            w_k_g = w_k[k_mask_g]
+
+            phase = k_vec_g @ pos_g.T
+            cos_phase = torch.cos(phase)
+            sin_phase = torch.sin(phase)
+            w_cos = cos_phase * w_k_g.unsqueeze(1)
+            w_sin = sin_phase * w_k_g.unsqueeze(1)
+            J = (cos_phase.T @ w_cos + sin_phase.T @ w_sin) * (
+                2.0 * FIELD_CONSTANT / vol_g
+            )
+
+            A = J + torch.diag(eta_g + 1e-6)
+            aug = torch.zeros(n_g + 1, n_g + 1, dtype=dtype, device=device)
+            aug[:n_g, :n_g] = A
+            aug[:n_g, n_g] = 1.0
+            aug[n_g, :n_g] = 1.0
+            rhs = torch.zeros(n_g + 1, dtype=dtype, device=device)
+            rhs[:n_g] = -chi_g
+            rhs[n_g] = Q_tot[g]
+
+            sol = torch.linalg.solve(aug, rhs)
+            q_g = sol[:n_g]
+            all_charges[idx_g] = q_g
+
+            e_onsite = (chi_g * q_g).sum() + 0.5 * (eta_g * q_g**2).sum()
+            e_coulomb = 0.5 * (q_g * torch.mv(J, q_g)).sum()
+            e_qeq_list.append(e_onsite + e_coulomb)
+
+        return all_charges, torch.stack(e_qeq_list)
+
+    def forward(
+        self,
+        data: Dict[str, torch.Tensor],
+        training: bool = False,
+        compute_force: bool = True,
+        compute_virials: bool = False,
+        compute_stress: bool = False,
+        compute_displacement: bool = False,
+        compute_hessian: bool = False,
+        compute_edge_forces: bool = False,
+        compute_atomic_stresses: bool = False,
+        lammps_mliap: bool = False,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        ctx = prepare_graph(
+            data,
+            compute_virials=compute_virials,
+            compute_stress=compute_stress,
+            compute_displacement=compute_displacement,
+        )
+        num_atoms_arange = ctx.num_atoms_arange.to(torch.int64)
+        num_graphs = ctx.num_graphs
+        displacement = ctx.displacement
+        positions = ctx.positions
+        vectors = ctx.vectors
+        lengths = ctx.lengths
+        cell = ctx.cell
+        node_heads = ctx.node_heads.to(torch.int64)
+
+        Q = data["total_charge"].view(num_graphs).to(dtype=positions.dtype)
+        Q_int = Q.detach().long()
+        for q_val in Q_int.cpu().tolist():
+            if q_val not in self._q_to_idx_keys.tolist():
+                raise ValueError(
+                    f"Unseen charge state Q={q_val}. "
+                    f"Known: {self.known_charges.tolist()}."
+                )
+        Q_idx = torch.zeros_like(Q_int)
+        for i in range(self._q_to_idx_keys.numel()):
+            Q_idx[Q_int == self._q_to_idx_keys[i]] = self._q_to_idx_vals[i]
+
+        node_e0 = self.atomic_energies_fn(data["node_attrs"])[
+            num_atoms_arange, node_heads
+        ]
+        e0 = scatter_sum(
+            src=node_e0, index=data["batch"], dim=0, dim_size=num_graphs
+        ).to(vectors.dtype)
+
+        node_feats = self.node_embedding(data["node_attrs"])
+        e_Q = self.charge_embedding(Q_idx)
+        node_feats = node_feats + e_Q[data["batch"]].to(dtype=node_feats.dtype)
+
+        edge_attrs = self.spherical_harmonics(vectors)
+        edge_feats, cutoff = self.radial_embedding(
+            lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
+        )
+        if hasattr(self, "pair_repulsion"):
+            pair_node_energy = self.pair_repulsion_fn(
+                lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
+            )
+        else:
+            pair_node_energy = torch.zeros_like(node_e0)
+
+        node_es_list = [pair_node_energy]
+        node_feats_list: List[torch.Tensor] = []
+        for i, (interaction, product) in enumerate(
+            zip(self.interactions, self.products)
+        ):
+            node_feats, sc = interaction(
+                node_attrs=data["node_attrs"],
+                node_feats=node_feats,
+                edge_attrs=edge_attrs,
+                edge_feats=edge_feats,
+                edge_index=data["edge_index"],
+                cutoff=cutoff,
+                first_layer=(i == 0),
+            )
+            node_feats = product(
+                node_feats=node_feats, sc=sc, node_attrs=data["node_attrs"]
+            )
+            node_feats_list.append(node_feats)
+
+        for i, readout in enumerate(self.readouts):
+            feat_idx = -1 if len(self.readouts) == 1 else i
+            node_es_list.append(
+                readout(node_feats_list[feat_idx], node_heads)[
+                    num_atoms_arange, node_heads
+                ]
+            )
+
+        chi_per_atom = torch.zeros_like(node_e0)
+        eta_per_atom = torch.zeros_like(node_e0)
+        for i, (chi_readout, eta_readout) in enumerate(
+            zip(self.chi_readouts, self.eta_readouts)
+        ):
+            feat_idx = -1 if len(self.chi_readouts) == 1 else i
+            h = node_feats_list[feat_idx]
+            chi_per_atom = chi_per_atom + chi_readout(h, node_heads)[
+                num_atoms_arange, node_heads
+            ]
+            eta_per_atom = eta_per_atom + eta_readout(h, node_heads)[
+                num_atoms_arange, node_heads
+            ]
+        eta_per_atom = torch.nn.functional.softplus(eta_per_atom)
+
+        node_feats_out = torch.cat(node_feats_list, dim=-1)
+        node_inter_es = torch.sum(torch.stack(node_es_list, dim=0), dim=0)
+        node_inter_es = self.scale_shift(node_inter_es, node_heads)
+        inter_e = scatter_sum(node_inter_es, data["batch"], dim=-1, dim_size=num_graphs)
+
+        qeq_charges, e_qeq = self._solve_qeq_and_energy(
+            chi=chi_per_atom,
+            eta=eta_per_atom,
+            positions=positions,
+            batch=data["batch"],
+            cell=cell.view(num_graphs, 3, 3),
+            Q_tot=Q,
+            num_graphs=num_graphs,
+        )
+
+        total_energy = e0 + inter_e + e_qeq
+        node_energy = node_e0.clone().double() + node_inter_es.clone().double()
+        energy_for_forces = inter_e + e_qeq
+
+        forces, virials, stress, hessian, edge_forces = get_outputs(
+            energy=energy_for_forces,
+            positions=positions,
+            displacement=displacement,
+            vectors=vectors,
+            cell=cell,
+            training=training,
+            compute_force=compute_force,
+            compute_virials=compute_virials,
+            compute_stress=compute_stress,
+            compute_hessian=compute_hessian,
+            compute_edge_forces=compute_edge_forces or compute_atomic_stresses,
+        )
+
+        atomic_virials: Optional[torch.Tensor] = None
+        atomic_stresses: Optional[torch.Tensor] = None
+        if compute_atomic_stresses and edge_forces is not None:
+            atomic_virials, atomic_stresses = get_atomic_virials_stresses(
+                edge_forces=edge_forces,
+                edge_index=data["edge_index"],
+                vectors=vectors,
+                num_atoms=positions.shape[0],
+                batch=data["batch"],
+                cell=cell,
+            )
+
+        return {
+            "energy": total_energy,
+            "node_energy": node_energy,
+            "interaction_energy": inter_e,
+            "qeq_energy": e_qeq,
+            "qeq_charges": qeq_charges,
+            "chi": chi_per_atom,
+            "eta": eta_per_atom,
+            "forces": forces,
+            "edge_forces": edge_forces,
+            "virials": virials,
+            "stress": stress,
+            "atomic_virials": atomic_virials,
+            "atomic_stresses": atomic_stresses,
+            "hessian": hessian,
+            "displacement": displacement,
+            "node_feats": node_feats_out,
         }

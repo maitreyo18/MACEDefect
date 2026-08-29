@@ -172,6 +172,7 @@ def train(
     distributed_model: Optional[DistributedDataParallel] = None,
     train_sampler: Optional[DistributedSampler] = None,
     rank: Optional[int] = 0,
+    verbose: bool = False,
 ):
     lowest_loss = np.inf
     valid_loss = np.inf
@@ -243,6 +244,7 @@ def train(
             distributed=distributed,
             distributed_model=distributed_model,
             rank=rank,
+            verbose=verbose,
         )
         if distributed:
             torch.distributed.barrier()
@@ -361,6 +363,7 @@ def train_one_epoch(
     distributed: bool,
     distributed_model: Optional[DistributedDataParallel] = None,
     rank: Optional[int] = 0,
+    verbose: bool = False,
 ) -> None:
     model_to_train = model if distributed_model is None else distributed_model
 
@@ -382,7 +385,8 @@ def train_one_epoch(
         if rank == 0:
             logger.log(opt_metrics)
     else:
-        for batch in data_loader:
+        epoch_E_inter, epoch_E_qeq, epoch_natoms = 0.0, 0.0, 0.0
+        for batch_idx, batch in enumerate(data_loader):
             _, opt_metrics = take_step(
                 model=model_to_train,
                 loss_fn=loss_fn,
@@ -392,11 +396,92 @@ def train_one_epoch(
                 output_args=output_args,
                 max_grad_norm=max_grad_norm,
                 device=device,
+                verbose=verbose and batch_idx == 0,
+                epoch=epoch,
             )
+            if "qeq_energy_sum" in opt_metrics:
+                epoch_E_inter += opt_metrics["qeq_interaction_energy_sum"]
+                epoch_E_qeq += opt_metrics["qeq_energy_sum"]
+                epoch_natoms += opt_metrics["qeq_natoms"]
             opt_metrics["mode"] = "opt"
             opt_metrics["epoch"] = epoch
             if rank == 0:
                 logger.log(opt_metrics)
+        if verbose and epoch_natoms > 0:
+            logging.info(
+                f"  Epoch energy decomposition (mean/atom): "
+                f"E_inter={epoch_E_inter / epoch_natoms:.4f} eV, "
+                f"E_QEq={epoch_E_qeq / epoch_natoms:.6f} eV"
+            )
+
+
+def _log_qeq_diagnostics(model, output, batch, epoch: int) -> None:
+    """Gradient/energy-decomposition diagnostics for MACEDefect models
+    (only called when the model output contains qeq_energy)."""
+    logging.info(f"--- Gradient diagnostics (epoch {epoch}, batch 0) ---")
+    if output.get("forces") is not None and getattr(batch, "forces", None) is not None:
+        F_pred = output["forces"].detach()
+        F_ref = batch.forces.to(F_pred.dtype)
+        F_err = (F_pred - F_ref).norm(dim=-1)
+        logging.info(
+            f"  forces: pred_rms={F_pred.norm(dim=-1).mean():.4f} eV/Å, "
+            f"ref_rms={F_ref.norm(dim=-1).mean():.4f} eV/Å, "
+            f"err_rms={F_err.mean():.4f} eV/Å"
+        )
+    if output.get("energy") is not None and getattr(batch, "energy", None) is not None:
+        num_atoms = (batch.ptr[1:] - batch.ptr[:-1]).float()
+        E_pred = output["energy"].detach() / num_atoms
+        E_ref = batch.energy.to(E_pred.dtype) / num_atoms
+        logging.info(
+            f"  energy/atom: pred_mean={E_pred.mean():.4f} eV, "
+            f"ref_mean={E_ref.mean():.4f} eV, "
+            f"err_mean={(E_pred - E_ref).abs().mean():.4f} eV"
+        )
+    E_inter_b = output.get("interaction_energy")
+    if E_inter_b is not None:
+        num_atoms = (batch.ptr[1:] - batch.ptr[:-1]).float()
+        na = num_atoms.mean() + 1e-30
+        qeq_str = ""
+        if output.get("qeq_energy") is not None:
+            qeq_str = f", E_QEq={output['qeq_energy'].detach().mean() / na:.6f} eV"
+        logging.info(
+            f"  energy decomposition (mean/atom): "
+            f"E_inter={E_inter_b.detach().mean() / na:.4f} eV{qeq_str}"
+        )
+    if output.get("qeq_charges") is not None:
+        q = output["qeq_charges"].detach()
+        elem_idx = batch.node_attrs.argmax(dim=-1)
+        z_list = model.atomic_numbers
+        parts = []
+        for ei in elem_idx.unique().sort().values:
+            qi = q[elem_idx == ei]
+            z = z_list[ei.item()] if ei.item() < len(z_list) else ei.item()
+            parts.append(
+                f"Z={z}: mean={qi.mean():.4f}, std={qi.std():.4f}, "
+                f"min={qi.min():.4f}, max={qi.max():.4f}"
+            )
+        logging.info("  QEq charges per element: " + " | ".join(parts))
+
+    grad_report = sorted(
+        (
+            (n, p.grad.norm().item())
+            for n, p in model.named_parameters()
+            if p.grad is not None
+        ),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    logging.info("  Top-10 param grad norms:")
+    for n, g in grad_report[:10]:
+        logging.info(f"    {n}: {g:.6f}")
+    zero_grads = [n for n, g in grad_report if g < 1e-12]
+    if zero_grads:
+        logging.warning(f"  ZERO gradients on: {zero_grads}")
+    else:
+        logging.info("  All parameters have nonzero gradients ✓")
+    total_gnorm = sum(g**2 for _, g in grad_report) ** 0.5
+    logging.info(f"  Total grad norm (before clip): {total_gnorm:.4f}")
+    logging.info("--- End gradient diagnostics ---")
 
 
 def take_step(
@@ -408,10 +493,13 @@ def take_step(
     output_args: Dict[str, bool],
     max_grad_norm: Optional[float],
     device: torch.device,
+    verbose: bool = False,
+    epoch: int = 0,
 ) -> Tuple[float, Dict[str, Any]]:
     start_time = time.time()
     batch = batch.to(device)
     batch_dict = batch.to_dict()
+    output_holder: Dict[str, Any] = {}
 
     def closure():
         optimizer.zero_grad(set_to_none=True)
@@ -426,6 +514,10 @@ def take_step(
         loss.backward()
         if max_grad_norm is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+        if output.get("qeq_energy") is not None:
+            output_holder["output"] = output
+            if verbose:
+                _log_qeq_diagnostics(model, output, batch, epoch)
 
         return loss
 
@@ -439,6 +531,13 @@ def take_step(
         "loss": to_numpy(loss),
         "time": time.time() - start_time,
     }
+    if "output" in output_holder:
+        with torch.no_grad():
+            out = output_holder["output"]
+            natoms = (batch.ptr[1:] - batch.ptr[:-1]).float().sum().item()
+            loss_dict["qeq_interaction_energy_sum"] = out["interaction_energy"].detach().sum().item()
+            loss_dict["qeq_energy_sum"] = out["qeq_energy"].detach().sum().item()
+            loss_dict["qeq_natoms"] = natoms
 
     return loss, loss_dict
 

@@ -1,0 +1,85 @@
+# MACEDefect training configuration, fused into mace's own CLI.
+# Run with: mace_run_train --config config/scratch_config.yaml
+# =============================================================================
+
+# Identity
+name: "MACEDefect_CsPbX3"
+seed: 278
+model: "MACEDefect"
+
+# I/O paths
+train_file: "/depot/amannodi/data/Maitreyo_calcs/CsPbX3_X-doping/Ortho/Final_csvs/Datasets_final_CsPbX3/CsPbX3_final_filtered.xyz"
+work_dir:   "MACEDefect_outputs"
+model_dir:  "MACEDefect_outputs"
+log_dir:    "MACEDefect_outputs"
+
+valid_fraction: 0.1
+
+# XYZ data keys
+energy_key:       "REF_energy"
+forces_key:       "REF_forces"
+total_charge_key: "total_charge"
+
+# Device & precision
+device:        "cuda"
+default_dtype: "float64"
+enable_cueq:   False
+
+# -----------------------------------------------------------------------
+# Architecture (from scratch — no foundation model)
+# -----------------------------------------------------------------------
+r_max:              6.0
+num_channels:       64
+max_L:              1
+num_interactions:   2
+correlation:        3
+pair_repulsion:     True
+distance_transform: "Agnesi"
+
+# Scaling
+scaling: "rms_forces_scaling"
+
+# E0s: least-squares regression on Q=0 (neutral) training data only
+E0s: "average"
+
+# MACEDefect-specific
+density_smearing_width: 1.2
+
+# -----------------------------------------------------------------------
+# Training
+# -----------------------------------------------------------------------
+max_num_epochs: 380
+batch_size: 10
+
+# Optimizer
+lr:           0.005
+weight_decay: 1.0e-5
+optimizer:    "adam"
+
+lr_params_factors: '{"embedding_lr_factor": 0.5, "interactions_lr_factor": 0.5, "products_lr_factor": 0.5, "readouts_lr_factor": 0.5}'
+
+# LR scheduler
+scheduler:  "ExponentialLR"
+lr_scheduler_gamma: 0.99
+patience: 50
+
+# EMA
+ema:       True
+ema_decay: 0.99
+
+# Gradient clipping
+clip_grad: 10.0
+
+verbose: True
+
+# -----------------------------------------------------------------------
+# Loss weights (MSE energy + MSE forces)
+# -----------------------------------------------------------------------
+energy_weight: 30.0
+forces_weight: 50.0
+stress_weight: 0.0
+
+# -----------------------------------------------------------------------
+# Stage 2 — SWA fine-tuning (disabled)
+# -----------------------------------------------------------------------
+swa: False

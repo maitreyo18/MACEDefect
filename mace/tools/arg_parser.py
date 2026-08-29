@@ -144,6 +144,7 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
             "AtomicDipolesMACE",
             "AtomicDielectricMACE",
             "EnergyDipolesMACE",
+            "MACEDefect",
         ],
     )
     parser.add_argument(
@@ -1004,6 +1005,20 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--eval_interval", help="evaluate model every <n> epochs", type=int, default=1
+    )
+    parser.add_argument(
+        "--verbose",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Log per-batch gradient/energy-decomposition diagnostics each epoch "
+        "(MACEDefect models only; no effect on other model types).",
+    )
+    parser.add_argument(
+        "--density_smearing_width",
+        type=float,
+        default=1.2,
+        help="Gaussian smearing width (Angstrom) for the QEq Coulomb kernel "
+        "(MACEDefect model only).",
     )
     parser.add_argument(
         "--keep_checkpoints",
