@@ -1,4 +1,4 @@
-# MACEDefect (fused into mace)
+# MACEDefect (MACE extension for charged systems)
 
 Charge-aware MACE with charge equilibration (QEq) for charged point defects in periodic solids, fused directly into this mace codebase as model type `MACEDefect` — no separate package.
 
