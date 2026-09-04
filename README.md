@@ -10,6 +10,7 @@ Everything else (training CLI, `MACECalculator`, cuEquivariance acceleration, ch
 
 ```bash
 pip install -r requirements.txt
+git clone https://github.com/maitreyo18/MACEDefect.git
 pip install -e .
 ```
 
