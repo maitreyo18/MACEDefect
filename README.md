@@ -1,6 +1,6 @@
 # MACEDefect (Charge extension to MACE family of MLIPs)
 
-Charge-aware MACE with charge equilibration (QEq) for charged point defects in periodic solids, fused directly into this mace codebase as model type `MACEDefect` — no separate package.
+Charge-aware MACE with charge equilibration (QEq) for charged point defects in periodic solids, fused directly into this mace codebase as model type `MACEDefect`.
 
 `E_total = E0 + E_inter + E_QEq` — the total charge `Q` conditions a learned embedding added to every atom's species embedding before message passing, and QEq charges/energy are solved analytically each forward pass.
 
